@@ -1,3 +1,4 @@
+import functools
 import warnings
 from typing import Literal
 
@@ -20,6 +21,71 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     remap_xcd,
 )
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
+
+# (BLOCK_M, BLOCK_N, num_warps, num_stages, waves_per_eu, PRE_LOAD_V)
+_GFX1151_FWD_TILES: dict[int, tuple] = {
+    64: (128, 32, 4, 1, 1, False),
+    128: (128, 32, 8, 1, 6, False),
+    256: (128, 32, 8, 1, 2, False),
+}
+# Padded head dims that were not measured keep the previous gfx1151 tile.
+_GFX1151_FWD_FALLBACK_TILE = (128, 64, 8, 1, 1, False)
+
+
+def _fwd_tile_to_config(tile: tuple) -> triton.Config:
+    block_m, block_n, num_warps, num_stages, waves_per_eu, pre_load_v = tile
+    return triton.Config(
+        {
+            "BLOCK_M": block_m,
+            "BLOCK_N": block_n,
+            "waves_per_eu": waves_per_eu,
+            "PRE_LOAD_V": pre_load_v,
+        },
+        num_stages=num_stages,
+        num_warps=num_warps,
+    )
+
+
+def _gfx1151_fwd_configs() -> list[triton.Config]:
+    # The D128 tile leads the list so that a caller that turns autotuning off and
+    # therefore takes configs[0] still gets the tile that covers almost all of the
+    # measured work. Every tile of _GFX1151_FWD_TILES has to be in this list,
+    # otherwise fwd_prefill_early_config_prune cannot select it.
+    tiles = [_GFX1151_FWD_TILES[128]]
+    tiles += [tile for dim, tile in sorted(_GFX1151_FWD_TILES.items()) if dim != 128]
+    tiles.append(_GFX1151_FWD_FALLBACK_TILE)
+    return [_fwd_tile_to_config(tile) for tile in tiles]
+
+
+@functools.lru_cache(maxsize=1)
+def _is_gfx1151() -> bool:
+    return get_arch().name == "gfx1151"
+
+
+def fwd_prefill_early_config_prune(configs, named_args, **kwargs):
+    """Pin the measured gfx1151 tile for the padded head dim.
+
+    `triton.autotune` calls this before it would benchmark candidates, so a
+    single surviving config selects the tile without any launch-time tuning.
+    Other devices (or a config list that is not the gfx1151 set, e.g. the
+    sweep-mode list) keep their caller's candidates.
+    """
+    if not _is_gfx1151():
+        return configs
+
+    tile = _GFX1151_FWD_TILES.get(
+        kwargs.get("BLOCK_DMODEL_QK"), _GFX1151_FWD_FALLBACK_TILE
+    )
+    wanted = _fwd_tile_to_config(tile)
+    for config in configs:
+        if (
+            config.kwargs == wanted.kwargs
+            and config.num_warps == wanted.num_warps
+            and config.num_stages == wanted.num_stages
+        ):
+            return [config]
+    return configs
+
 
 FWD_PREFILL_AUTOTUNE_KEYS = [
     "IS_CAUSAL",
@@ -58,21 +124,8 @@ def get_fwd_prefill_configs(mode: AutotuneMode):
                 ),
             ]
         elif arch.is_rdna:
-            # gfx1151 (Strix Halo / RDNA3.5): tuned for the Qwen3-Omni
-            # ViT prefill shape (B=1, S=3200, H=16, head_dim=72, fp16).
             if arch.name == "gfx1151":
-                return [
-                    triton.Config(
-                        {
-                            "BLOCK_M": 128,
-                            "BLOCK_N": 64,
-                            "PRE_LOAD_V": False,
-                            "waves_per_eu": 2,
-                        },
-                        num_stages=1,
-                        num_warps=8,
-                    ),
-                ]
+                return _gfx1151_fwd_configs()
             BLOCK_N = 64 if arch.name == "gfx1100" else 32
             return [
                 triton.Config(
@@ -175,21 +228,8 @@ def get_fwd_prefill_configs(mode: AutotuneMode):
                     )
                 ]
         elif arch.is_rdna:
-            # gfx1151 (Strix Halo / RDNA3.5): tuned for the Qwen3-Omni
-            # ViT prefill shape (B=1, S=3200, H=16, head_dim=72, fp16).
             if arch.name == "gfx1151":
-                return [
-                    triton.Config(
-                        {
-                            "BLOCK_M": 128,
-                            "BLOCK_N": 64,
-                            "PRE_LOAD_V": False,
-                            "waves_per_eu": 2,
-                        },
-                        num_stages=1,
-                        num_warps=8,
-                    ),
-                ]
+                return _gfx1151_fwd_configs()
             BLOCK_N = 64 if arch.name == "gfx1100" else 32
             return [
                 triton.Config(
@@ -811,6 +851,7 @@ def compute_block_masking(
 @triton.autotune(
     configs=fwd_prefill_autotune_configs,
     key=FWD_PREFILL_AUTOTUNE_KEYS,
+    prune_configs_by={"early_config_prune": fwd_prefill_early_config_prune},
 )
 @triton.jit
 def attn_fwd(
