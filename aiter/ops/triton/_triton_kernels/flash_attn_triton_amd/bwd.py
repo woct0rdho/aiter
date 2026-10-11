@@ -1,3 +1,4 @@
+import functools
 import warnings
 from typing import Literal
 
@@ -42,6 +43,93 @@ NONCAUSAL_AUTOTUNE_KEYS = [
     "HQ",
     "HK",
 ]
+
+# (BLOCK_M1, BLOCK_N1, BLOCK_N2, BLK_SLICE_FACTOR, num_warps, num_stages, waves_per_eu)
+# BLOCK_M2 must equal BLOCK_N1: the dQ store is indexed by the same pid as the dK/dV block.
+# The inner loops additionally require BLOCK_M1 <= BLOCK_N1.
+_GFX1151_BWD_TILES: dict[int, tuple] = {
+    64: (16, 64, 16, 2, 4, 1, 1),
+    128: (16, 16, 16, 2, 4, 1, 1),
+    256: (16, 16, 16, 2, 4, 1, 1),
+}
+_GFX1151_BWD_LONG_TILE = (16, 64, 16, 2, 4, 2, 1)
+_GFX1151_BWD_LONG_PRESSURE = 200_000
+_GFX1151_BWD_CAUSAL_TILES: dict[int, tuple] = {
+    64: (16, 64, 16, 2, 4, 1, 1),
+    128: (16, 64, 16, 2, 4, 2, 1),
+    256: (16, 64, 16, 2, 4, 2, 1),
+}
+# Padded head dims that were not measured keep the previous gfx1151 tile.
+_GFX1151_BWD_FALLBACK_TILE = (32, 32, 32, 2, 4, 1, 1)
+
+
+def _bwd_tile_to_config(tile: tuple) -> triton.Config:
+    block_m1, block_n1, block_n2, blk_slice_factor, num_warps, num_stages, waves_per_eu = tile
+    return triton.Config(
+        {
+            "BLOCK_M1": block_m1,
+            "BLOCK_N1": block_n1,
+            "BLOCK_M2": block_n1,
+            "BLOCK_N2": block_n2,
+            "BLK_SLICE_FACTOR": blk_slice_factor,
+            "waves_per_eu": waves_per_eu,
+        },
+        num_stages=num_stages,
+        num_warps=num_warps,
+    )
+
+
+def _gfx1151_bwd_configs(causal: bool) -> list[triton.Config]:
+    # The D128 tile leads the list so that a caller that turns autotuning off and therefore
+    # takes configs[0] still gets the tile that covers most of the measured work. Every
+    # table entry has to be in this list, otherwise the prune cannot select it.
+    table = _GFX1151_BWD_CAUSAL_TILES if causal else _GFX1151_BWD_TILES
+    tiles = [table[128]]
+    tiles += [tile for dim, tile in sorted(table.items()) if dim != 128]
+    if not causal:
+        tiles.append(_GFX1151_BWD_LONG_TILE)
+    tiles.append(_GFX1151_BWD_FALLBACK_TILE)
+    unique = list(dict.fromkeys(tiles))
+    return [_bwd_tile_to_config(tile) for tile in unique]
+
+
+@functools.lru_cache(maxsize=1)
+def _is_gfx1151() -> bool:
+    return get_arch().name == "gfx1151"
+
+
+def _bwd_early_config_prune(configs, named_args, causal=False, **kwargs):
+    """Pin the measured gfx1151 fused-backward tile for the padded value head dim.
+
+    `triton.autotune` calls this before it would benchmark candidates, so a single surviving
+    config selects the tile without any launch-time tuning. Other devices keep their
+    caller's candidates.
+    """
+    if not _is_gfx1151():
+        return configs
+
+    table = _GFX1151_BWD_CAUSAL_TILES if causal else _GFX1151_BWD_TILES
+    dim = kwargs.get("HEAD_DIM_V", kwargs.get("ACTUAL_HEAD_DIM_V"))
+    tile = table.get(dim, _GFX1151_BWD_FALLBACK_TILE)
+    if not causal:
+        named = named_args or {}
+        seqlen_k = named.get("max_seqlen_k")
+        if seqlen_k is not None:
+            heads_q = named.get("HQ", kwargs.get("HQ"))
+            # Without a head count, fall back to the sequence-length form of the measured range.
+            pressure = heads_q * seqlen_k if heads_q is not None else (seqlen_k * 16 if seqlen_k >= 12288 else 0)
+            if pressure >= _GFX1151_BWD_LONG_PRESSURE:
+                tile = _GFX1151_BWD_LONG_TILE
+    wanted = _bwd_tile_to_config(tile)
+    for config in configs:
+        if (
+            config.kwargs == wanted.kwargs
+            and config.num_warps == wanted.num_warps
+            and config.num_stages == wanted.num_stages
+        ):
+            return [config]
+
+    return configs
 
 
 def get_bwd_configs(mode: AutotuneMode):
@@ -156,35 +244,42 @@ def get_bwd_configs(mode: AutotuneMode):
                 ),
             ]
         elif arch.is_rdna:
-            preprocess_configs = [
-                triton.Config({"PRE_BLOCK": 32}, num_stages=1, num_warps=4),
-            ]
-            noncausal_configs = [
-                triton.Config(
-                    {
-                        "BLOCK_M1": 32,
-                        "BLOCK_N1": 32,
-                        "BLOCK_M2": 32,
-                        "BLOCK_N2": 32,
-                        "BLK_SLICE_FACTOR": 2,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
-            ]
-            causal_configs = [
-                triton.Config(
-                    {
-                        "BLOCK_M1": 32,
-                        "BLOCK_N1": 32,
-                        "BLOCK_M2": 32,
-                        "BLOCK_N2": 32,
-                        "BLK_SLICE_FACTOR": 2,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
-            ]
+            if arch.name == "gfx1151":
+                preprocess_configs = [
+                    triton.Config({"PRE_BLOCK": 32}, num_stages=1, num_warps=4),
+                ]
+                noncausal_configs = _gfx1151_bwd_configs(causal=False)
+                causal_configs = _gfx1151_bwd_configs(causal=True)
+            else:
+                preprocess_configs = [
+                    triton.Config({"PRE_BLOCK": 32}, num_stages=1, num_warps=4),
+                ]
+                noncausal_configs = [
+                    triton.Config(
+                        {
+                            "BLOCK_M1": 32,
+                            "BLOCK_N1": 32,
+                            "BLOCK_M2": 32,
+                            "BLOCK_N2": 32,
+                            "BLK_SLICE_FACTOR": 2,
+                        },
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                ]
+                causal_configs = [
+                    triton.Config(
+                        {
+                            "BLOCK_M1": 32,
+                            "BLOCK_N1": 32,
+                            "BLOCK_M2": 32,
+                            "BLOCK_N2": 32,
+                            "BLK_SLICE_FACTOR": 2,
+                        },
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                ]
         else:
             preprocess_configs = [
                 triton.Config(
@@ -585,35 +680,42 @@ def get_bwd_configs(mode: AutotuneMode):
                 ),
             ]
         elif arch.is_rdna:
-            preprocess_configs = [
-                triton.Config({"PRE_BLOCK": 32}, num_stages=1, num_warps=4),
-            ]
-            noncausal_configs = [
-                triton.Config(
-                    {
-                        "BLOCK_M1": 32,
-                        "BLOCK_N1": 32,
-                        "BLOCK_M2": 32,
-                        "BLOCK_N2": 32,
-                        "BLK_SLICE_FACTOR": 2,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
-            ]
-            causal_configs = [
-                triton.Config(
-                    {
-                        "BLOCK_M1": 32,
-                        "BLOCK_N1": 32,
-                        "BLOCK_M2": 32,
-                        "BLOCK_N2": 32,
-                        "BLK_SLICE_FACTOR": 2,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
-            ]
+            if arch.name == "gfx1151":
+                preprocess_configs = [
+                    triton.Config({"PRE_BLOCK": 32}, num_stages=1, num_warps=4),
+                ]
+                noncausal_configs = _gfx1151_bwd_configs(causal=False)
+                causal_configs = _gfx1151_bwd_configs(causal=True)
+            else:
+                preprocess_configs = [
+                    triton.Config({"PRE_BLOCK": 32}, num_stages=1, num_warps=4),
+                ]
+                noncausal_configs = [
+                    triton.Config(
+                        {
+                            "BLOCK_M1": 32,
+                            "BLOCK_N1": 32,
+                            "BLOCK_M2": 32,
+                            "BLOCK_N2": 32,
+                            "BLK_SLICE_FACTOR": 2,
+                        },
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                ]
+                causal_configs = [
+                    triton.Config(
+                        {
+                            "BLOCK_M1": 32,
+                            "BLOCK_N1": 32,
+                            "BLOCK_M2": 32,
+                            "BLOCK_N2": 32,
+                            "BLK_SLICE_FACTOR": 2,
+                        },
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                ]
         else:
             preprocess_configs = [
                 triton.Config(
@@ -3338,6 +3440,7 @@ def _sliding_window_k_bounds(
 @triton.autotune(
     configs=causal_autotune_configs,
     key=CAUSAL_AUTOTUNE_KEYS,
+    prune_configs_by={"early_config_prune": functools.partial(_bwd_early_config_prune, causal=True)},
 )
 @triton.jit
 def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), batch)
@@ -3972,6 +4075,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
 @triton.autotune(
     configs=noncausal_autotune_configs,
     key=NONCAUSAL_AUTOTUNE_KEYS,
+    prune_configs_by={"early_config_prune": _bwd_early_config_prune},
 )
 @triton.jit
 def bwd_kernel_fused_noncausal(
